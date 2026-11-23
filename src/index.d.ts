@@ -1,4 +1,4 @@
-export type BytesInput = string | Uint8Array;
+export type BytesInput = string | Uint8Array | ArrayBufferView;
 export type WasmSource = Uint8Array | ArrayBuffer | WebAssembly.Module | URL | string;
 
 export interface StorageBackend {
@@ -6,12 +6,26 @@ export interface StorageBackend {
   write(offset: number, src: Uint8Array): void;
   len(): number;
   setLen(newLen: number): void;
+  flushWrites?(): void;
   sync(): void;
   close(): void;
 }
 
 export interface MemoryBackend extends StorageBackend {
   toUint8Array(): Uint8Array;
+}
+
+/**
+ * Minimal structural type matching WebWorker's FileSystemSyncAccessHandle so
+ * consumers in Node.js or DOM-only TypeScript configs do not require lib.webworker.d.ts.
+ */
+export interface OpfsSyncAccessHandle {
+  read(buffer: ArrayBufferView | ArrayBuffer, options?: { at?: number }): number;
+  write(buffer: ArrayBufferView | ArrayBuffer, options?: { at?: number }): number;
+  getSize(): number;
+  truncate(newSize: number): void;
+  flush(): void;
+  close(): void;
 }
 
 export interface OpenOptions {
@@ -25,11 +39,19 @@ export interface OpenOptions {
 
 export interface OpfsOpenOptions extends OpenOptions {
   create?: boolean;
+  /** Whether backend.sync() calls syncHandle.flush() (default: true). */
+  sync?: boolean;
 }
 
 export interface WriteTxOptions {
-  /** If false, uses Durability::None for fast un-fsynced batches (default: true). */
+  /** If false, uses Durability::None (pages remain in redb RAM cache until eviction/close). Default: true. */
   durable?: boolean;
+  /**
+   * When durable is true and sync is false, writes all CoW pages and the checksummed
+   * superblock to the OS/OPFS handle (process-crash/SIGKILL safe) while skipping the
+   * hardware fsync/flush call until an explicit db.sync() or durable sync commit. Default: true.
+   */
+  sync?: boolean;
 }
 
 export interface ScanOptions {
@@ -48,6 +70,11 @@ export interface ScanEntry {
 export class ReadTransaction {
   get(table: string, key: BytesInput): Uint8Array | null;
   getInto(table: string, key: BytesInput, target: Uint8Array, targetOffset?: number): number;
+  /**
+   * Zero-copy view into WASM memory for the value bytes, or null if not found.
+   * Only valid synchronously until the next redb-js call on this runtime.
+   */
+  getView(table: string, key: BytesInput): Uint8Array | null;
   getText(table: string, key: BytesInput): string | null;
   scan(table: string, options?: ScanOptions): ScanEntry[];
   scanEach(
@@ -107,6 +134,8 @@ export class Redb {
   deleteSavepoint(savepointId: number): boolean;
   listSavepoints(): number[];
 
+  /** Explicitly flush coalesced writes and call backend.sync(). */
+  sync(): void;
   compact(): boolean;
   checkIntegrity(): boolean;
   close(): void;
@@ -121,8 +150,9 @@ export function setDefaultWasmModule(mod: WebAssembly.Module): void;
 export function createMemoryBackend(initialBytes?: Uint8Array): MemoryBackend;
 export function createOpfsBackend(
   path: string,
-  options?: { create?: boolean }
+  options?: { create?: boolean; sync?: boolean }
 ): Promise<StorageBackend>;
 export function createOpfsBackendFromHandle(
-  syncHandle: FileSystemSyncAccessHandle
+  syncHandle: OpfsSyncAccessHandle,
+  options?: { sync?: boolean }
 ): StorageBackend;

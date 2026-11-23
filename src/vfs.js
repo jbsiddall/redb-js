@@ -38,12 +38,6 @@ function parentDir(p) {
   return idx <= 0 ? "/" : p.slice(0, idx);
 }
 
-function baseName(p) {
-  if (p === "/") return "";
-  const idx = p.lastIndexOf("/");
-  return p.slice(idx + 1);
-}
-
 /**
  * Build key `[path_utf8][0x00][u32_be chunkIndex]`.
  * Big-endian chunkIndex ensures chunks sort in exact numeric order.

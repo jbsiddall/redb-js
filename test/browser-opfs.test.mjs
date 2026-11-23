@@ -134,13 +134,15 @@ async function runChromePhase(chromeBin, profileDir, url, waitForReport) {
   let stderr = "";
   proc.stderr.on("data", (d) => (stderr += d.toString()));
 
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(`Browser test timed out on ${url}\n${stderr}`)), 20_000)
-  );
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Browser test timed out on ${url}\n${stderr}`)), 20_000);
+  });
 
   try {
     return await Promise.race([waitForReport, timeout]);
   } finally {
+    clearTimeout(timer);
     proc.kill("SIGTERM");
     await new Promise((r) => proc.once("exit", r));
   }

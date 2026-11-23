@@ -284,3 +284,79 @@ test("Synchronous openNodeSync, openMemorySync, getInto, and scanEach", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("Correctness guards: re-entrant write tx, scanEach re-entrancy, limit:0, getView, coalesced writes & read-ahead", async () => {
+  const dir = tmpDir();
+  const dbPath = path.join(dir, "guards.redb");
+
+  try {
+    const db = openNodeSync(dbPath, { cacheSize: 4 * 1024 * 1024 });
+
+    // Re-entrant beginWrite / compact / checkIntegrity must throw cleanly without bricking WASM
+    const tx1 = db.beginWrite();
+    assert.throws(() => db.beginWrite(), /already active/i);
+    assert.throws(() => db.compact(), /active/i);
+    assert.throws(() => db.checkIntegrity(), /active/i);
+    tx1.set("t", "k1", "v1");
+    tx1.commit();
+
+    // Runtime remains healthy after rejected re-entrant calls
+    assert.equal(db.getText("t", "k1"), "v1");
+    assert.equal(db.checkIntegrity(), true);
+
+    // Durable write with sync: false writes to OS page cache (survives reopen) without fsync
+    db.writeTransaction(
+      (tx) => {
+        for (let i = 0; i < 120; i++) {
+          const payload = new Uint8Array(2048);
+          payload.fill(i & 0xff);
+          tx.set("bulk", `row-${String(i).padStart(4, "0")}`, payload);
+        }
+      },
+      { durable: true, sync: false }
+    );
+    db.sync();
+
+    // scanEach re-entrancy guard, getView, and limit: 0
+    db.readTransaction((rtx) => {
+      assert.deepEqual(rtx.scan("bulk", { limit: 0 }), []);
+      assert.equal(
+        rtx.scanEach("bulk", { limit: 0 }, () => {
+          throw new Error("should not run");
+        }),
+        0
+      );
+
+      const view = rtx.getView("bulk", "row-0042");
+      assert.equal(view.byteLength, 2048);
+      assert.equal(view[0], 42);
+      assert.equal(view[2047], 42);
+
+      assert.throws(() => {
+        rtx.scanEach("bulk", { limit: 2 }, () => {
+          rtx.get("t", "k1");
+        });
+      }, /re-entrantly/i);
+    });
+
+    // Empty write past EOF must not corrupt cached backend.len()
+    const beforeLen = db.backend.len();
+    db.backend.write(beforeLen + 4096, new Uint8Array(0));
+    assert.equal(db.backend.len(), beforeLen);
+
+    db.close();
+
+    // Cold reopen exercises sequential read-ahead across all 120 coalesced entries
+    const db2 = openNodeSync(dbPath);
+    for (let i = 0; i < 120; i++) {
+      const val = db2.get("bulk", `row-${String(i).padStart(4, "0")}`);
+      assert.equal(val.byteLength, 2048);
+      assert.equal(val[0], i & 0xff);
+      assert.equal(val[2047], i & 0xff);
+    }
+    assert.equal(db2.checkIntegrity(), true);
+    db2.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

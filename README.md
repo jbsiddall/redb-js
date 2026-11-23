@@ -1,18 +1,20 @@
 # redb-js
 
-A super-thin WebAssembly wrapper around [`redb`](https://github.com/cberner/redb) (pure-Rust, Copy-on-Write, ACID B-tree store) for **Browser OPFS** (`FileSystemSyncAccessHandle`) and **Node.js**, plus an optional chunked **single-file Virtual Filesystem (`RedbFS`)**.
+A super-thin WebAssembly wrapper around [`redb`](https://github.com/cberner/redb) (pure-Rust, Copy-on-Write, ACID B-tree store) for **Browser OPFS** (`FileSystemSyncAccessHandle`), **Node.js**, **Bun**, and **Deno**, plus an optional chunked **single-file Virtual Filesystem (`RedbFS`)**.
 
 ## Supply-Chain & Footprint
 - **npm runtime dependencies:** `0` (`dependencies: {}`)
 - **Rust WASM dependencies:** `1` (`redb` with `default-features = false`, **0 transitive crates**)
 - **No `wasm-bindgen`, no proc-macros, no native C/N-API build matrix** — compiles cleanly with plain `cargo build --target wasm32-unknown-unknown --release`.
-- **Same single-file binary format** across Browser OPFS, Node.js, and in-memory buffers.
+- **Same single-file binary format** across Browser OPFS, Node.js, Bun, Deno, and in-memory buffers.
 
 ## Features
 - **Single file on disk / OPFS** (no WAL/SHM/lock sidecar files)
 - **Full ACID transactions** (`writeTransaction` auto-commits or rolls back on error)
-- **MVCC Snapshot Isolation** (`readTransaction` / `beginRead`)
-- **Built-in configurable RAM page cache** (`cacheSize`, default 16 MiB)
+- **Sync & async open APIs** (`openNode`, `openNodeSync`, `Redb.open`, `Redb.openSync`, `Redb.openOpfs`, `Redb.openMemory`, `Redb.openMemorySync`)
+- **MVCC Snapshot Isolation** (`readTransaction` / `beginRead`) + zero-allocation read helpers (`getInto`, `getView`, `scanEach`)
+- **Built-in configurable RAM page cache** (`cacheSize`, default 16 MiB) + sorted write coalescing and sequential read-ahead
+- **Flexible commit durability** (`{ durable: true, sync: true }` full fsync/flush, `{ durable: true, sync: false }` OS/OPFS-flushed process-crash-safe commits + explicit `db.sync()`, or `{ durable: false }` `Durability::None`)
 - **Copy-on-Write persistent snapshots & rollbacks** (`createSavepoint` / `restoreSavepoint`)
 - **Range & prefix scans** (forward, reverse, limit)
 - **Chunked Virtual Filesystem (`RedbFS`)**: `writeFile`, O(1) `appendFile`, `readFile`, random-access `readRange` / `writeRange`, `truncate`, `mkdir`, `readdir`, atomic `rename`, `rm`, and whole-FS CoW `snapshot()` / `restoreSnapshot()`.
@@ -21,7 +23,7 @@ A super-thin WebAssembly wrapper around [`redb`](https://github.com/cberner/redb
 
 ## Quick Start
 
-### Node.js (Single File on Disk)
+### Node.js, Bun, and Deno (Single File on Disk)
 
 ```js
 import { openNode } from "redb-js/node";

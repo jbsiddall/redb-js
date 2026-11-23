@@ -97,6 +97,8 @@ class WasmRuntime {
     this._scratchCap = 0;
     this._scratchInUse = false;
     this._suppressGrowthSync = false;
+    this._suppressCommitFsync = false;
+    this._scanning = false;
     /** @type {Map<string, Uint8Array>} */
     this._tableCache = new Map();
 
@@ -116,7 +118,9 @@ class WasmRuntime {
           const entry = this.backends.get(handle);
           if (!entry) return -1;
           try {
-            const view = getMemU8().subarray(dstPtr, dstPtr + dstLen);
+            const p = dstPtr >>> 0;
+            const n = dstLen >>> 0;
+            const view = getMemU8().subarray(p, p + n);
             return entry.backend.read(offset, view);
           } catch (err) {
             entry.lastError = err instanceof Error ? err : new Error(String(err));
@@ -127,7 +131,9 @@ class WasmRuntime {
           const entry = this.backends.get(handle);
           if (!entry) return -1;
           try {
-            const view = getMemU8().subarray(srcPtr, srcPtr + srcLen);
+            const p = srcPtr >>> 0;
+            const n = srcLen >>> 0;
+            const view = getMemU8().subarray(p, p + n);
             entry.backend.write(offset, view);
             return 0;
           } catch (err) {
@@ -161,6 +167,12 @@ class WasmRuntime {
           const entry = this.backends.get(handle);
           if (!entry) return -1;
           try {
+            if (this._suppressCommitFsync) {
+              if (typeof entry.backend.flushWrites === "function") {
+                entry.backend.flushWrites();
+              }
+              return 0;
+            }
             entry.backend.sync();
             return 0;
           } catch (err) {
@@ -187,6 +199,12 @@ class WasmRuntime {
     this.exports = instance.exports;
   }
 
+  _assertNotScanning() {
+    if (this._scanning) {
+      throw new Error("Cannot invoke redb operations re-entrantly inside a scanEach callback");
+    }
+  }
+
   registerBackend(backend) {
     const handle = this.nextBackendHandle++;
     this.backends.set(handle, { backend, lastError: null });
@@ -194,8 +212,8 @@ class WasmRuntime {
   }
 
   getLastError(backendHandle) {
-    const ptr = this.exports.last_error_ptr();
-    const len = this.exports.last_error_len();
+    const ptr = this.exports.last_error_ptr() >>> 0;
+    const len = this.exports.last_error_len() >>> 0;
     const wasmMsg =
       len > 0
         ? decoder.decode(new Uint8Array(this.exports.memory.buffer, ptr, len))
@@ -221,15 +239,22 @@ class WasmRuntime {
   }
 
   readResultCopy() {
-    const ptr = this.exports.result_ptr();
-    const len = this.exports.result_len();
+    const ptr = this.exports.result_ptr() >>> 0;
+    const len = this.exports.result_len() >>> 0;
     if (len === 0) return new Uint8Array(0);
     return this.getMemU8().slice(ptr, ptr + len);
   }
 
+  readResultView() {
+    const ptr = this.exports.result_ptr() >>> 0;
+    const len = this.exports.result_len() >>> 0;
+    if (len === 0) return new Uint8Array(0);
+    return this.getMemU8().subarray(ptr, ptr + len);
+  }
+
   readResultInto(target, targetOffset = 0) {
-    const ptr = this.exports.result_ptr();
-    const len = this.exports.result_len();
+    const ptr = this.exports.result_ptr() >>> 0;
+    const len = this.exports.result_len() >>> 0;
     if (len === 0) return 0;
     const avail = target.byteLength - targetOffset;
     const copyLen = len < avail ? len : avail;
@@ -248,7 +273,7 @@ class WasmRuntime {
     }
     let nextCap = 16384;
     while (nextCap < needed) nextCap *= 2;
-    this._scratchPtr = this.exports.alloc(nextCap);
+    this._scratchPtr = this.exports.alloc(nextCap) >>> 0;
     this._scratchCap = nextCap;
     return this._scratchPtr;
   }
@@ -262,6 +287,7 @@ class WasmRuntime {
    * @returns {T}
    */
   withBuffers(buffers, fn) {
+    this._assertNotScanning();
     if (!this._scratchInUse) {
       let total = 0;
       for (let i = 0; i < buffers.length; i++) {
@@ -301,7 +327,7 @@ class WasmRuntime {
           ptrs.push(0);
           lens.push(0);
         } else {
-          const ptr = this.exports.alloc(b.byteLength);
+          const ptr = this.exports.alloc(b.byteLength) >>> 0;
           this.getMemU8().set(b, ptr);
           ptrs.push(ptr);
           lens.push(b.byteLength);
@@ -321,6 +347,7 @@ class WasmRuntime {
    * Direct zero-allocation fast path for 2-buffer WASM calls (table + key).
    */
   call2(table, key, wasmFn, txId) {
+    this._assertNotScanning();
     const tBytes = this.encodeTable(table);
     const kBytes = key instanceof Uint8Array ? key : toBytes(key);
     const tLen = tBytes.byteLength;
@@ -357,6 +384,7 @@ class WasmRuntime {
    * Direct zero-allocation fast path for 3-buffer WASM calls (table + key + value).
    */
   call3(table, key, value, wasmFn, txId) {
+    this._assertNotScanning();
     const tBytes = this.encodeTable(table);
     const kBytes = key instanceof Uint8Array ? key : toBytes(key);
     const vBytes = value instanceof Uint8Array ? value : toBytes(value);
@@ -398,8 +426,8 @@ class WasmRuntime {
   }
 
   decodeScanResult() {
-    const ptr = this.exports.result_ptr();
-    const len = this.exports.result_len();
+    const ptr = this.exports.result_ptr() >>> 0;
+    const len = this.exports.result_len() >>> 0;
     if (len < 4) return [];
     const mem = this.getMemU8();
     const view = new DataView(mem.buffer, ptr, len);
@@ -426,23 +454,29 @@ class WasmRuntime {
    * @param {(key: Uint8Array, value: Uint8Array) => void} cb
    */
   forEachScanResult(cb) {
-    const ptr = this.exports.result_ptr();
-    const len = this.exports.result_len();
+    this._assertNotScanning();
+    const ptr = this.exports.result_ptr() >>> 0;
+    const len = this.exports.result_len() >>> 0;
     if (len < 4) return 0;
     const mem = this.getMemU8();
     const view = new DataView(mem.buffer, ptr, len);
     const count = view.getUint32(0, true);
     let pos = 4;
-    for (let i = 0; i < count; i++) {
-      const kLen = view.getUint32(pos, true);
-      pos += 4;
-      const key = mem.subarray(ptr + pos, ptr + pos + kLen);
-      pos += kLen;
-      const vLen = view.getUint32(pos, true);
-      pos += 4;
-      const value = mem.subarray(ptr + pos, ptr + pos + vLen);
-      pos += vLen;
-      cb(key, value);
+    this._scanning = true;
+    try {
+      for (let i = 0; i < count; i++) {
+        const kLen = view.getUint32(pos, true);
+        pos += 4;
+        const key = mem.subarray(ptr + pos, ptr + pos + kLen);
+        pos += kLen;
+        const vLen = view.getUint32(pos, true);
+        pos += 4;
+        const value = mem.subarray(ptr + pos, ptr + pos + vLen);
+        pos += vLen;
+        cb(key, value);
+      }
+    } finally {
+      this._scanning = false;
     }
     return count;
   }
@@ -488,7 +522,10 @@ async function getRuntime(wasmSource) {
   if (!defaultRuntime) {
     if (!defaultModule) {
       if (!defaultModulePromise) {
-        defaultModulePromise = loadWasmModule();
+        defaultModulePromise = loadWasmModule().catch((err) => {
+          defaultModulePromise = null;
+          throw err;
+        });
       }
       defaultModule = await defaultModulePromise;
     }
@@ -576,6 +613,20 @@ export class ReadTransaction {
   }
 
   /**
+   * Read a value as a zero-copy view directly into WASM memory, or null if not found.
+   * Only valid synchronously until the next redb-js call on this runtime.
+   * @param {string} table
+   * @param {string | Uint8Array} key
+   * @returns {Uint8Array | null}
+   */
+  getView(table, key) {
+    this._ensureOpen();
+    const rc = this._rt.call2(table, key, this._rt.exports.rtx_get, this._id);
+    if (rc < 0) throw this._rt.getLastError(this._backendHandle);
+    return rc === 1 ? this._rt.readResultView() : null;
+  }
+
+  /**
    * @param {string} table
    * @param {string | Uint8Array} key
    * @returns {string | null}
@@ -592,6 +643,7 @@ export class ReadTransaction {
    */
   scan(table, options = {}) {
     this._ensureOpen();
+    if (options.limit === 0) return [];
     const tBytes = this._rt.encodeTable(table);
     const { startBytes, endBytes, reverse, limit } = resolveScanBounds(options);
     const rc = this._rt.withBuffers(
@@ -625,6 +677,7 @@ export class ReadTransaction {
    */
   scanEach(table, options, cb) {
     this._ensureOpen();
+    if (options && options.limit === 0) return 0;
     const tBytes = this._rt.encodeTable(table);
     const { startBytes, endBytes, reverse, limit } = resolveScanBounds(options);
     const rc = this._rt.withBuffers(
@@ -651,6 +704,7 @@ export class ReadTransaction {
   /** @returns {string[]} */
   listTables() {
     this._ensureOpen();
+    this._rt._assertNotScanning();
     const rc = this._rt.exports.rtx_list_tables(this._id);
     if (rc < 0) throw this._rt.getLastError(this._backendHandle);
     const buf = this._rt.readResultCopy();
@@ -680,10 +734,12 @@ export class ReadTransaction {
  * Full ACID write transaction.
  */
 export class WriteTransaction {
-  constructor(runtime, txId, backendHandle) {
+  constructor(runtime, txId, backendHandle, db = null, syncOnCommit = true) {
     this._rt = runtime;
     this._id = txId;
     this._backendHandle = backendHandle;
+    this._db = db;
+    this._syncOnCommit = syncOnCommit;
     this._finished = false;
   }
 
@@ -771,6 +827,7 @@ export class WriteTransaction {
    */
   scan(table, options = {}) {
     this._ensureOpen();
+    if (options.limit === 0) return [];
     const tBytes = this._rt.encodeTable(table);
     const { startBytes, endBytes, reverse, limit } = resolveScanBounds(options);
     const rc = this._rt.withBuffers(
@@ -845,15 +902,31 @@ export class WriteTransaction {
 
   commit() {
     this._ensureOpen();
+    this._rt._assertNotScanning();
     this._finished = true;
-    const rc = this._rt.exports.wtx_commit(this._id);
+    const prevSuppress = this._rt._suppressCommitFsync;
+    if (!this._syncOnCommit) {
+      this._rt._suppressCommitFsync = true;
+    }
+    let rc;
+    try {
+      rc = this._rt.exports.wtx_commit(this._id);
+    } finally {
+      this._rt._suppressCommitFsync = prevSuppress;
+      if (this._db) this._db._hasActiveWriteTx = false;
+    }
     if (rc < 0) throw this._rt.getLastError(this._backendHandle);
   }
 
   abort() {
     if (this._finished) return;
     this._finished = true;
-    const rc = this._rt.exports.wtx_abort(this._id);
+    let rc;
+    try {
+      rc = this._rt.exports.wtx_abort(this._id);
+    } finally {
+      if (this._db) this._db._hasActiveWriteTx = false;
+    }
     if (rc < 0) throw this._rt.getLastError(this._backendHandle);
   }
 }
@@ -869,6 +942,7 @@ export class Redb {
     this._backendHandle = backendHandle;
     this.backend = backend;
     this._closed = false;
+    this._hasActiveWriteTx = false;
   }
 
   /**
@@ -926,6 +1000,7 @@ export class Redb {
   static async openOpfs(path, options = {}) {
     const backend = await createOpfsBackend(path, {
       create: options.readOnly ? false : options.create !== false,
+      sync: options.sync,
     });
     try {
       return await Redb.open(backend, options);
@@ -971,14 +1046,20 @@ export class Redb {
   }
 
   /**
-   * @param {{ durable?: boolean }} [options]
+   * @param {{ durable?: boolean, sync?: boolean }} [options]
    */
   beginWrite(options = {}) {
     this._ensureOpen();
+    this._rt._assertNotScanning();
+    if (this._hasActiveWriteTx) {
+      throw new Error("A write transaction is already active on this database");
+    }
     const durable = options.durable === false ? 0 : 1;
+    const syncOnCommit = options.sync !== false;
     const txId = this._rt.exports.wtx_begin(this._id, durable);
     if (txId < 0) throw this._rt.getLastError(this._backendHandle);
-    return new WriteTransaction(this._rt, txId, this._backendHandle);
+    this._hasActiveWriteTx = true;
+    return new WriteTransaction(this._rt, txId, this._backendHandle, this, syncOnCommit);
   }
 
   /**
@@ -1061,8 +1142,20 @@ export class Redb {
     return this.writeTransaction((tx) => tx.listSavepoints(), { durable: false });
   }
 
+  /**
+   * Explicitly flush any coalesced backend writes and sync to durable storage.
+   */
+  sync() {
+    this._ensureOpen();
+    this.backend.sync();
+  }
+
   compact() {
     this._ensureOpen();
+    this._rt._assertNotScanning();
+    if (this._hasActiveWriteTx) {
+      throw new Error("Cannot compact while a write transaction is active on this database");
+    }
     const rc = this._rt.exports.db_compact(this._id);
     if (rc < 0) throw this._rt.getLastError(this._backendHandle);
     return rc === 1;
@@ -1070,6 +1163,10 @@ export class Redb {
 
   checkIntegrity() {
     this._ensureOpen();
+    this._rt._assertNotScanning();
+    if (this._hasActiveWriteTx) {
+      throw new Error("Cannot checkIntegrity while a write transaction is active on this database");
+    }
     const rc = this._rt.exports.db_check_integrity(this._id);
     if (rc < 0) throw this._rt.getLastError(this._backendHandle);
     return rc === 1;
@@ -1078,8 +1175,14 @@ export class Redb {
   close() {
     if (this._closed) return;
     this._closed = true;
-    const rc = this._rt.exports.db_close(this._id);
-    if (rc < 0) throw this._rt.getLastError(this._backendHandle);
+    let rc;
+    try {
+      rc = this._rt.exports.db_close(this._id);
+      if (rc < 0) throw this._rt.getLastError(this._backendHandle);
+    } finally {
+      this._hasActiveWriteTx = false;
+      this._rt.backends.delete(this._backendHandle);
+    }
   }
 }
 

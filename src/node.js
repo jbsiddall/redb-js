@@ -19,7 +19,7 @@ export function ensureNodeWasmLoadedSync() {
  * Open (or create) a single-file redb database on disk in Node.js, Bun, or Deno.
  *
  * @param {string} filePath Path to the single .redb file
- * @param {{ cacheSize?: number, readOnly?: boolean, createDirs?: boolean, mode?: number, wasm?: Uint8Array | ArrayBuffer | WebAssembly.Module | URL | string }} [options]
+ * @param {{ cacheSize?: number, readOnly?: boolean, createDirs?: boolean, mode?: number, sync?: boolean, wasm?: Uint8Array | ArrayBuffer | WebAssembly.Module | URL | string }} [options]
  * @returns {Promise<Redb>}
  */
 export async function openNode(filePath, options = {}) {
@@ -27,6 +27,7 @@ export async function openNode(filePath, options = {}) {
     readOnly: options.readOnly,
     createDirs: options.createDirs,
     mode: options.mode,
+    sync: options.sync,
   });
   try {
     return await Redb.open(backend, options);
@@ -42,7 +43,7 @@ export async function openNode(filePath, options = {}) {
  * Synchronously open (or create) a single-file redb database on disk in Node.js, Bun, or Deno.
  *
  * @param {string} filePath Path to the single .redb file
- * @param {{ cacheSize?: number, readOnly?: boolean, createDirs?: boolean, mode?: number, wasm?: Uint8Array | ArrayBuffer | WebAssembly.Module }} [options]
+ * @param {{ cacheSize?: number, readOnly?: boolean, createDirs?: boolean, mode?: number, sync?: boolean, wasm?: Uint8Array | ArrayBuffer | WebAssembly.Module }} [options]
  * @returns {Redb}
  */
 export function openNodeSync(filePath, options = {}) {
@@ -53,6 +54,7 @@ export function openNodeSync(filePath, options = {}) {
     readOnly: options.readOnly,
     createDirs: options.createDirs,
     mode: options.mode,
+    sync: options.sync,
   });
   try {
     return Redb.openSync(backend, options);

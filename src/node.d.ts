@@ -12,6 +12,8 @@ export {
 export interface NodeOpenOptions extends OpenOptions {
   createDirs?: boolean;
   mode?: number;
+  /** Whether backend.sync() calls fsync/fdatasync (default: true). */
+  sync?: boolean;
 }
 
 export interface NodeSyncOpenOptions extends Omit<NodeOpenOptions, "wasm"> {
@@ -22,7 +24,7 @@ export function ensureNodeWasmLoadedSync(): void;
 
 export function createNodeFileBackend(
   filePath: string,
-  options?: { readOnly?: boolean; createDirs?: boolean; mode?: number }
+  options?: { readOnly?: boolean; createDirs?: boolean; mode?: number; sync?: boolean }
 ): StorageBackend;
 
 export function openNode(filePath: string, options?: NodeOpenOptions): Promise<import("./index.js").Redb>;
