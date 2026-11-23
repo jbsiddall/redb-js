@@ -47,8 +47,14 @@ export interface ScanEntry {
 
 export class ReadTransaction {
   get(table: string, key: BytesInput): Uint8Array | null;
+  getInto(table: string, key: BytesInput, target: Uint8Array, targetOffset?: number): number;
   getText(table: string, key: BytesInput): string | null;
   scan(table: string, options?: ScanOptions): ScanEntry[];
+  scanEach(
+    table: string,
+    options: ScanOptions,
+    cb: (key: Uint8Array, value: Uint8Array) => void
+  ): number;
   listTables(): string[];
   close(): void;
 }
@@ -72,8 +78,16 @@ export class Redb {
   readonly backend: StorageBackend;
 
   static open(backend: StorageBackend, options?: OpenOptions): Promise<Redb>;
+  static openSync(
+    backend: StorageBackend,
+    options?: Omit<OpenOptions, "wasm"> & { wasm?: Uint8Array | ArrayBuffer | WebAssembly.Module }
+  ): Redb;
   static openOpfs(path: string, options?: OpfsOpenOptions): Promise<Redb>;
   static openMemory(initialBytes?: Uint8Array, options?: OpenOptions): Promise<Redb>;
+  static openMemorySync(
+    initialBytes?: Uint8Array,
+    options?: Omit<OpenOptions, "wasm"> & { wasm?: Uint8Array | ArrayBuffer | WebAssembly.Module }
+  ): Redb;
 
   beginRead(): ReadTransaction;
   beginWrite(options?: WriteTxOptions): WriteTransaction;
@@ -100,6 +114,10 @@ export class Redb {
 
 export function toBytes(input: BytesInput): Uint8Array;
 export function prefixUpperBound(prefix: Uint8Array): Uint8Array | null;
+export function compileWasmSync(
+  wasmSource: Uint8Array | ArrayBuffer | WebAssembly.Module
+): WebAssembly.Module;
+export function setDefaultWasmModule(mod: WebAssembly.Module): void;
 export function createMemoryBackend(initialBytes?: Uint8Array): MemoryBackend;
 export function createOpfsBackend(
   path: string,

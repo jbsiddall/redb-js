@@ -89,8 +89,26 @@ class WasmRuntime {
     this.backends = new Map();
     /** @type {WebAssembly.Exports | null} */
     this.exports = null;
+    /** @type {ArrayBuffer | null} */
+    this._memBuf = null;
+    /** @type {Uint8Array | null} */
+    this._memU8 = null;
+    this._scratchPtr = 0;
+    this._scratchCap = 0;
+    this._scratchInUse = false;
+    this._suppressGrowthSync = false;
+    /** @type {Map<string, Uint8Array>} */
+    this._tableCache = new Map();
 
-    const getMemU8 = () => new Uint8Array(this.exports.memory.buffer);
+    const getMemU8 = () => {
+      const buf = this.exports.memory.buffer;
+      if (this._memBuf !== buf) {
+        this._memBuf = buf;
+        this._memU8 = new Uint8Array(buf);
+      }
+      return this._memU8;
+    };
+    this.getMemU8 = getMemU8;
 
     const imports = {
       env: {
@@ -139,6 +157,7 @@ class WasmRuntime {
           }
         },
         host_sync: (handle) => {
+          if (this._suppressGrowthSync) return 0;
           const entry = this.backends.get(handle);
           if (!entry) return -1;
           try {
@@ -190,21 +209,90 @@ class WasmRuntime {
     return new Error(wasmMsg);
   }
 
+  encodeTable(table) {
+    if (table instanceof Uint8Array) return table;
+    let cached = this._tableCache.get(table);
+    if (!cached) {
+      cached = encoder.encode(table);
+      if (this._tableCache.size >= 256) this._tableCache.clear();
+      this._tableCache.set(table, cached);
+    }
+    return cached;
+  }
+
   readResultCopy() {
     const ptr = this.exports.result_ptr();
     const len = this.exports.result_len();
     if (len === 0) return new Uint8Array(0);
-    return new Uint8Array(this.exports.memory.buffer, ptr, len).slice();
+    return this.getMemU8().slice(ptr, ptr + len);
+  }
+
+  readResultInto(target, targetOffset = 0) {
+    const ptr = this.exports.result_ptr();
+    const len = this.exports.result_len();
+    if (len === 0) return 0;
+    const avail = target.byteLength - targetOffset;
+    const copyLen = len < avail ? len : avail;
+    if (copyLen > 0) {
+      target.set(this.getMemU8().subarray(ptr, ptr + copyLen), targetOffset);
+    }
+    return len;
+  }
+
+  _ensureScratch(needed) {
+    if (needed <= this._scratchCap) return this._scratchPtr;
+    if (this._scratchPtr !== 0 && this._scratchCap > 0) {
+      this.exports.dealloc(this._scratchPtr, this._scratchCap);
+      this._scratchPtr = 0;
+      this._scratchCap = 0;
+    }
+    let nextCap = 16384;
+    while (nextCap < needed) nextCap *= 2;
+    this._scratchPtr = this.exports.alloc(nextCap);
+    this._scratchCap = nextCap;
+    return this._scratchPtr;
   }
 
   /**
    * Copy JS bytes into WASM memory, run callback, and free.
+   * Uses a reusable scratch buffer to avoid per-call alloc/dealloc crossings.
    * @template T
    * @param {Uint8Array[]} buffers
    * @param {(ptrs: number[], lens: number[]) => T} fn
    * @returns {T}
    */
   withBuffers(buffers, fn) {
+    if (!this._scratchInUse) {
+      let total = 0;
+      for (let i = 0; i < buffers.length; i++) {
+        const b = buffers[i];
+        if (b && b.byteLength > 0) total += b.byteLength;
+      }
+      this._scratchInUse = true;
+      try {
+        const base = total > 0 ? this._ensureScratch(total) : 0;
+        const mem = total > 0 ? this.getMemU8() : null;
+        const ptrs = new Array(buffers.length);
+        const lens = new Array(buffers.length);
+        let cur = base;
+        for (let i = 0; i < buffers.length; i++) {
+          const b = buffers[i];
+          if (!b || b.byteLength === 0) {
+            ptrs[i] = 0;
+            lens[i] = 0;
+          } else {
+            mem.set(b, cur);
+            ptrs[i] = cur;
+            lens[i] = b.byteLength;
+            cur += b.byteLength;
+          }
+        }
+        return fn(ptrs, lens);
+      } finally {
+        this._scratchInUse = false;
+      }
+    }
+
     const ptrs = [];
     const lens = [];
     try {
@@ -214,7 +302,7 @@ class WasmRuntime {
           lens.push(0);
         } else {
           const ptr = this.exports.alloc(b.byteLength);
-          new Uint8Array(this.exports.memory.buffer, ptr, b.byteLength).set(b);
+          this.getMemU8().set(b, ptr);
           ptrs.push(ptr);
           lens.push(b.byteLength);
         }
@@ -229,32 +317,168 @@ class WasmRuntime {
     }
   }
 
+  /**
+   * Direct zero-allocation fast path for 2-buffer WASM calls (table + key).
+   */
+  call2(table, key, wasmFn, txId) {
+    const tBytes = this.encodeTable(table);
+    const kBytes = key instanceof Uint8Array ? key : toBytes(key);
+    const tLen = tBytes.byteLength;
+    const kLen = kBytes.byteLength;
+    if (!this._scratchInUse) {
+      const total = tLen + kLen;
+      this._scratchInUse = true;
+      try {
+        const base = total > 0 ? this._ensureScratch(total) : 0;
+        const mem = total > 0 ? this.getMemU8() : null;
+        let tPtr = 0;
+        let kPtr = 0;
+        let cur = base;
+        if (tLen > 0) {
+          mem.set(tBytes, cur);
+          tPtr = cur;
+          cur += tLen;
+        }
+        if (kLen > 0) {
+          mem.set(kBytes, cur);
+          kPtr = cur;
+        }
+        return wasmFn(txId, tPtr, tLen, kPtr, kLen);
+      } finally {
+        this._scratchInUse = false;
+      }
+    }
+    return this.withBuffers([tBytes, kBytes], (p, l) =>
+      wasmFn(txId, p[0], l[0], p[1], l[1])
+    );
+  }
+
+  /**
+   * Direct zero-allocation fast path for 3-buffer WASM calls (table + key + value).
+   */
+  call3(table, key, value, wasmFn, txId) {
+    const tBytes = this.encodeTable(table);
+    const kBytes = key instanceof Uint8Array ? key : toBytes(key);
+    const vBytes = value instanceof Uint8Array ? value : toBytes(value);
+    const tLen = tBytes.byteLength;
+    const kLen = kBytes.byteLength;
+    const vLen = vBytes.byteLength;
+    if (!this._scratchInUse) {
+      const total = tLen + kLen + vLen;
+      this._scratchInUse = true;
+      try {
+        const base = total > 0 ? this._ensureScratch(total) : 0;
+        const mem = total > 0 ? this.getMemU8() : null;
+        let tPtr = 0;
+        let kPtr = 0;
+        let vPtr = 0;
+        let cur = base;
+        if (tLen > 0) {
+          mem.set(tBytes, cur);
+          tPtr = cur;
+          cur += tLen;
+        }
+        if (kLen > 0) {
+          mem.set(kBytes, cur);
+          kPtr = cur;
+          cur += kLen;
+        }
+        if (vLen > 0) {
+          mem.set(vBytes, cur);
+          vPtr = cur;
+        }
+        return wasmFn(txId, tPtr, tLen, kPtr, kLen, vPtr, vLen);
+      } finally {
+        this._scratchInUse = false;
+      }
+    }
+    return this.withBuffers([tBytes, kBytes, vBytes], (p, l) =>
+      wasmFn(txId, p[0], l[0], p[1], l[1], p[2], l[2])
+    );
+  }
+
   decodeScanResult() {
-    const buf = this.readResultCopy();
-    if (buf.byteLength < 4) return [];
-    const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const ptr = this.exports.result_ptr();
+    const len = this.exports.result_len();
+    if (len < 4) return [];
+    const mem = this.getMemU8();
+    const view = new DataView(mem.buffer, ptr, len);
     const count = view.getUint32(0, true);
     const out = new Array(count);
     let pos = 4;
     for (let i = 0; i < count; i++) {
       const kLen = view.getUint32(pos, true);
       pos += 4;
-      const key = buf.slice(pos, pos + kLen);
+      const key = mem.slice(ptr + pos, ptr + pos + kLen);
       pos += kLen;
       const vLen = view.getUint32(pos, true);
       pos += 4;
-      const value = buf.slice(pos, pos + vLen);
+      const value = mem.slice(ptr + pos, ptr + pos + vLen);
       pos += vLen;
       out[i] = { key, value };
     }
     return out;
   }
+
+  /**
+   * Iterate scan results directly from WASM memory with zero intermediate copies.
+   * Views passed to `cb` are only valid during the synchronous callback invocation.
+   * @param {(key: Uint8Array, value: Uint8Array) => void} cb
+   */
+  forEachScanResult(cb) {
+    const ptr = this.exports.result_ptr();
+    const len = this.exports.result_len();
+    if (len < 4) return 0;
+    const mem = this.getMemU8();
+    const view = new DataView(mem.buffer, ptr, len);
+    const count = view.getUint32(0, true);
+    let pos = 4;
+    for (let i = 0; i < count; i++) {
+      const kLen = view.getUint32(pos, true);
+      pos += 4;
+      const key = mem.subarray(ptr + pos, ptr + pos + kLen);
+      pos += kLen;
+      const vLen = view.getUint32(pos, true);
+      pos += 4;
+      const value = mem.subarray(ptr + pos, ptr + pos + vLen);
+      pos += vLen;
+      cb(key, value);
+    }
+    return count;
+  }
 }
 
 /** @type {Promise<WebAssembly.Module> | null} */
 let defaultModulePromise = null;
+/** @type {WebAssembly.Module | null} */
+let defaultModule = null;
 /** @type {WasmRuntime | null} */
 let defaultRuntime = null;
+
+/**
+ * Compile a synchronous WASM source (`WebAssembly.Module`, `Uint8Array`, or `ArrayBuffer`).
+ * @param {Uint8Array | ArrayBuffer | WebAssembly.Module} wasmSource
+ * @returns {WebAssembly.Module}
+ */
+export function compileWasmSync(wasmSource) {
+  if (wasmSource instanceof WebAssembly.Module) return wasmSource;
+  if (wasmSource instanceof Uint8Array || wasmSource instanceof ArrayBuffer) {
+    return new WebAssembly.Module(wasmSource);
+  }
+  throw new TypeError("Sync open requires a WebAssembly.Module, Uint8Array, or ArrayBuffer");
+}
+
+/**
+ * Register a pre-compiled default WebAssembly.Module for subsequent sync/async opens.
+ * @param {WebAssembly.Module} mod
+ */
+export function setDefaultWasmModule(mod) {
+  if (!(mod instanceof WebAssembly.Module)) {
+    throw new TypeError("Expected a WebAssembly.Module");
+  }
+  defaultModule = mod;
+  defaultModulePromise = Promise.resolve(mod);
+}
 
 async function getRuntime(wasmSource) {
   if (wasmSource) {
@@ -262,13 +486,30 @@ async function getRuntime(wasmSource) {
     return new WasmRuntime(mod);
   }
   if (!defaultRuntime) {
-    if (!defaultModulePromise) {
-      defaultModulePromise = loadWasmModule();
+    if (!defaultModule) {
+      if (!defaultModulePromise) {
+        defaultModulePromise = loadWasmModule();
+      }
+      defaultModule = await defaultModulePromise;
     }
-    const mod = await defaultModulePromise;
     if (!defaultRuntime) {
-      defaultRuntime = new WasmRuntime(mod);
+      defaultRuntime = new WasmRuntime(defaultModule);
     }
+  }
+  return defaultRuntime;
+}
+
+function getRuntimeSync(wasmSource) {
+  if (wasmSource) {
+    return new WasmRuntime(compileWasmSync(wasmSource));
+  }
+  if (!defaultRuntime) {
+    if (!defaultModule) {
+      throw new Error(
+        "redb WASM module is not loaded yet; pass options.wasm (WebAssembly.Module/Uint8Array), call Redb.open(), or use openNodeSync()"
+      );
+    }
+    defaultRuntime = new WasmRuntime(defaultModule);
   }
   return defaultRuntime;
 }
@@ -313,13 +554,25 @@ export class ReadTransaction {
    */
   get(table, key) {
     this._ensureOpen();
-    const tBytes = toBytes(table);
-    const kBytes = toBytes(key);
-    const rc = this._rt.withBuffers([tBytes, kBytes], (p, l) =>
-      this._rt.exports.rtx_get(this._id, p[0], l[0], p[1], l[1])
-    );
+    const rc = this._rt.call2(table, key, this._rt.exports.rtx_get, this._id);
     if (rc < 0) throw this._rt.getLastError(this._backendHandle);
     return rc === 1 ? this._rt.readResultCopy() : null;
+  }
+
+  /**
+   * Read a value directly into a caller-supplied Uint8Array without intermediate allocation.
+   * Returns the total value byte length if found, or -1 if the key does not exist.
+   * @param {string} table
+   * @param {string | Uint8Array} key
+   * @param {Uint8Array} target
+   * @param {number} [targetOffset=0]
+   * @returns {number}
+   */
+  getInto(table, key, target, targetOffset = 0) {
+    this._ensureOpen();
+    const rc = this._rt.call2(table, key, this._rt.exports.rtx_get, this._id);
+    if (rc < 0) throw this._rt.getLastError(this._backendHandle);
+    return rc === 1 ? this._rt.readResultInto(target, targetOffset) : -1;
   }
 
   /**
@@ -339,7 +592,7 @@ export class ReadTransaction {
    */
   scan(table, options = {}) {
     this._ensureOpen();
-    const tBytes = toBytes(table);
+    const tBytes = this._rt.encodeTable(table);
     const { startBytes, endBytes, reverse, limit } = resolveScanBounds(options);
     const rc = this._rt.withBuffers(
       [tBytes, startBytes ?? new Uint8Array(0), endBytes ?? new Uint8Array(0)],
@@ -360,6 +613,39 @@ export class ReadTransaction {
     );
     if (rc < 0) throw this._rt.getLastError(this._backendHandle);
     return this._rt.decodeScanResult();
+  }
+
+  /**
+   * Scan entries and invoke `cb(keyView, valueView)` with zero-copy views into WASM memory.
+   * Views are only valid synchronously inside `cb`; copy bytes if retaining them.
+   * @param {string} table
+   * @param {{ start?: string | Uint8Array, end?: string | Uint8Array, prefix?: string | Uint8Array, reverse?: boolean, limit?: number }} options
+   * @param {(key: Uint8Array, value: Uint8Array) => void} cb
+   * @returns {number}
+   */
+  scanEach(table, options, cb) {
+    this._ensureOpen();
+    const tBytes = this._rt.encodeTable(table);
+    const { startBytes, endBytes, reverse, limit } = resolveScanBounds(options);
+    const rc = this._rt.withBuffers(
+      [tBytes, startBytes ?? new Uint8Array(0), endBytes ?? new Uint8Array(0)],
+      (p, l) =>
+        this._rt.exports.rtx_scan(
+          this._id,
+          p[0],
+          l[0],
+          p[1],
+          l[1],
+          startBytes !== null ? 1 : 0,
+          p[2],
+          l[2],
+          endBytes !== null ? 1 : 0,
+          reverse,
+          limit
+        )
+    );
+    if (rc < 0) throw this._rt.getLastError(this._backendHandle);
+    return this._rt.forEachScanResult(cb);
   }
 
   /** @returns {string[]} */
@@ -412,11 +698,7 @@ export class WriteTransaction {
    */
   get(table, key) {
     this._ensureOpen();
-    const tBytes = toBytes(table);
-    const kBytes = toBytes(key);
-    const rc = this._rt.withBuffers([tBytes, kBytes], (p, l) =>
-      this._rt.exports.wtx_get(this._id, p[0], l[0], p[1], l[1])
-    );
+    const rc = this._rt.call2(table, key, this._rt.exports.wtx_get, this._id);
     if (rc < 0) throw this._rt.getLastError(this._backendHandle);
     return rc === 1 ? this._rt.readResultCopy() : null;
   }
@@ -438,12 +720,15 @@ export class WriteTransaction {
    */
   set(table, key, value) {
     this._ensureOpen();
-    const tBytes = toBytes(table);
-    const kBytes = toBytes(key);
-    const vBytes = toBytes(value);
-    const rc = this._rt.withBuffers([tBytes, kBytes, vBytes], (p, l) =>
-      this._rt.exports.wtx_set(this._id, p[0], l[0], p[1], l[1], p[2], l[2])
-    );
+    // Defer mid-transaction file-growth sync_data() calls until commit(),
+    // where redb syncs all data + grown length before updating the superblock.
+    this._rt._suppressGrowthSync = true;
+    let rc;
+    try {
+      rc = this._rt.call3(table, key, value, this._rt.exports.wtx_set, this._id);
+    } finally {
+      this._rt._suppressGrowthSync = false;
+    }
     if (rc < 0) throw this._rt.getLastError(this._backendHandle);
   }
 
@@ -454,11 +739,13 @@ export class WriteTransaction {
    */
   delete(table, key) {
     this._ensureOpen();
-    const tBytes = toBytes(table);
-    const kBytes = toBytes(key);
-    const rc = this._rt.withBuffers([tBytes, kBytes], (p, l) =>
-      this._rt.exports.wtx_delete(this._id, p[0], l[0], p[1], l[1])
-    );
+    this._rt._suppressGrowthSync = true;
+    let rc;
+    try {
+      rc = this._rt.call2(table, key, this._rt.exports.wtx_delete, this._id);
+    } finally {
+      this._rt._suppressGrowthSync = false;
+    }
     if (rc < 0) throw this._rt.getLastError(this._backendHandle);
     return rc === 1;
   }
@@ -469,7 +756,7 @@ export class WriteTransaction {
    */
   deleteTable(table) {
     this._ensureOpen();
-    const tBytes = toBytes(table);
+    const tBytes = this._rt.encodeTable(table);
     const rc = this._rt.withBuffers([tBytes], (p, l) =>
       this._rt.exports.wtx_delete_table(this._id, p[0], l[0])
     );
@@ -484,7 +771,7 @@ export class WriteTransaction {
    */
   scan(table, options = {}) {
     this._ensureOpen();
-    const tBytes = toBytes(table);
+    const tBytes = this._rt.encodeTable(table);
     const { startBytes, endBytes, reverse, limit } = resolveScanBounds(options);
     const rc = this._rt.withBuffers(
       [tBytes, startBytes ?? new Uint8Array(0), endBytes ?? new Uint8Array(0)],
@@ -606,6 +893,29 @@ export class Redb {
   }
 
   /**
+   * Synchronously open (or create) a redb database using any synchronous StorageBackend.
+   * Requires either `options.wasm` as a `WebAssembly.Module`/`Uint8Array`/`ArrayBuffer`
+   * or a previously loaded default WASM module (e.g. via `openNodeSync()` or `setDefaultWasmModule()`).
+   * @param {object} backend
+   * @param {{ cacheSize?: number, readOnly?: boolean, wasm?: Uint8Array | ArrayBuffer | WebAssembly.Module }} [options]
+   * @returns {Redb}
+   */
+  static openSync(backend, options = {}) {
+    const rt = getRuntimeSync(options.wasm);
+    const backendHandle = rt.registerBackend(backend);
+    const cacheBytes = options.cacheSize ?? 16 * 1024 * 1024;
+    const readOnly = options.readOnly ? 1 : 0;
+
+    const dbId = rt.exports.db_open(backendHandle, cacheBytes >>> 0, readOnly);
+    if (dbId < 0) {
+      const err = rt.getLastError(backendHandle);
+      rt.backends.delete(backendHandle);
+      throw err;
+    }
+    return new Redb(rt, dbId, backendHandle, backend);
+  }
+
+  /**
    * Open a single-file redb database in the browser's Origin Private File System (OPFS).
    * Must be called inside a Dedicated Web Worker.
    *
@@ -636,6 +946,17 @@ export class Redb {
   static async openMemory(initialBytes, options = {}) {
     const backend = createMemoryBackend(initialBytes);
     return Redb.open(backend, options);
+  }
+
+  /**
+   * Synchronously open a single-file redb database in memory.
+   * @param {Uint8Array} [initialBytes]
+   * @param {{ cacheSize?: number, readOnly?: boolean, wasm?: Uint8Array | ArrayBuffer | WebAssembly.Module }} [options]
+   * @returns {Redb}
+   */
+  static openMemorySync(initialBytes, options = {}) {
+    const backend = createMemoryBackend(initialBytes);
+    return Redb.openSync(backend, options);
   }
 
   _ensureOpen() {

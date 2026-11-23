@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { Redb } from "../src/index.js";
-import { openNode } from "../src/node.js";
+import { openNode, openNodeSync } from "../src/node.js";
 import { RedbFS } from "../src/vfs.js";
 
 function tmpDir() {
@@ -234,6 +234,52 @@ test("RedbFS single-file virtual filesystem: files, O(1) appends, random-access 
 
     // Still strictly ONE single file on disk!
     assert.deepEqual(fs.readdirSync(dir), ["vfs.redb"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Synchronous openNodeSync, openMemorySync, getInto, and scanEach", () => {
+  const dir = tmpDir();
+  const dbPath = path.join(dir, "sync.redb");
+
+  try {
+    const db = openNodeSync(dbPath, { cacheSize: 2 * 1024 * 1024 });
+    db.writeTransaction((tx) => {
+      tx.set("chunks", new Uint8Array([0, 0, 0, 1, 0, 0, 0, 0]), new Uint8Array([10, 20, 30]));
+      tx.set("chunks", new Uint8Array([0, 0, 0, 1, 0, 0, 0, 1]), new Uint8Array([40, 50]));
+      tx.set("chunks", new Uint8Array([0, 0, 0, 2, 0, 0, 0, 0]), new Uint8Array([99]));
+    });
+
+    db.readTransaction((rtx) => {
+      const target = new Uint8Array(8).fill(0xff);
+      const len = rtx.getInto("chunks", new Uint8Array([0, 0, 0, 1, 0, 0, 0, 0]), target, 2);
+      assert.equal(len, 3);
+      assert.deepEqual([...target], [0xff, 0xff, 10, 20, 30, 0xff, 0xff, 0xff]);
+      assert.equal(rtx.getInto("chunks", new Uint8Array([9, 9]), target, 0), -1);
+
+      const seen = [];
+      const count = rtx.scanEach(
+        "chunks",
+        {
+          start: new Uint8Array([0, 0, 0, 1, 0, 0, 0, 0]),
+          end: new Uint8Array([0, 0, 0, 1, 0, 0, 0, 2]),
+        },
+        (k, v) => {
+          seen.push({ page: k[7], data: [...v] });
+        }
+      );
+      assert.equal(count, 2);
+      assert.deepEqual(seen, [
+        { page: 0, data: [10, 20, 30] },
+        { page: 1, data: [40, 50] },
+      ]);
+    });
+    db.close();
+
+    const mem = Redb.openMemorySync(fs.readFileSync(dbPath));
+    assert.deepEqual([...mem.get("chunks", new Uint8Array([0, 0, 0, 2, 0, 0, 0, 0]))], [99]);
+    mem.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

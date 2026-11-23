@@ -5,17 +5,33 @@
  * in all modern browsers (Chrome, Firefox, Safari, Edge).
  */
 
+const HAS_SAB = typeof SharedArrayBuffer !== "undefined";
+
 /**
  * Wrap an already-opened FileSystemSyncAccessHandle as a redb-wasm StorageBackend.
  * @param {FileSystemSyncAccessHandle} syncHandle
  */
-export function createOpfsBackendFromHandle(syncHandle) {
+export function createOpfsBackendFromHandle(syncHandle, options = {}) {
   let closed = false;
+  const enableSync = options.sync !== false;
+  let cachedLen = syncHandle.getSize();
+  const ioOpts = { at: 0 };
+  /** @type {Uint8Array | null} */
+  let sabScratch = null;
 
   const ensureOpen = () => {
     if (closed) {
       throw new Error("OPFS backend is closed");
     }
+  };
+
+  const getSabScratch = (needed) => {
+    if (!sabScratch || sabScratch.byteLength < needed) {
+      let cap = 16384;
+      while (cap < needed) cap *= 2;
+      sabScratch = new Uint8Array(cap);
+    }
+    return sabScratch.subarray(0, needed);
   };
 
   return {
@@ -27,20 +43,20 @@ export function createOpfsBackendFromHandle(syncHandle) {
      */
     read(offset, dst) {
       ensureOpen();
-      const target =
-        typeof SharedArrayBuffer !== "undefined" &&
-        dst.buffer instanceof SharedArrayBuffer
-          ? new Uint8Array(dst.byteLength)
-          : dst;
+      const len = dst.byteLength;
+      const isSab = HAS_SAB && dst.buffer instanceof SharedArrayBuffer;
+      const target = isSab ? getSabScratch(len) : dst;
 
       let total = 0;
-      while (total < target.byteLength) {
-        const n = syncHandle.read(target.subarray(total), { at: offset + total });
+      while (total < len) {
+        ioOpts.at = offset + total;
+        const slice = total === 0 ? target : target.subarray(total);
+        const n = syncHandle.read(slice, ioOpts);
         if (n === 0) break;
         total += n;
       }
 
-      if (target !== dst && total > 0) {
+      if (isSab && total > 0) {
         dst.set(target.subarray(0, total), 0);
       }
       return total;
@@ -53,37 +69,46 @@ export function createOpfsBackendFromHandle(syncHandle) {
      */
     write(offset, src) {
       ensureOpen();
-      const source =
-        typeof SharedArrayBuffer !== "undefined" &&
-        src.buffer instanceof SharedArrayBuffer
-          ? src.slice()
-          : src;
+      const len = src.byteLength;
+      const isSab = HAS_SAB && src.buffer instanceof SharedArrayBuffer;
+      let source = src;
+      if (isSab) {
+        source = getSabScratch(len);
+        source.set(src);
+      }
 
       let total = 0;
-      while (total < source.byteLength) {
-        const n = syncHandle.write(source.subarray(total), { at: offset + total });
+      while (total < len) {
+        ioOpts.at = offset + total;
+        const slice = total === 0 ? source : source.subarray(total);
+        const n = syncHandle.write(slice, ioOpts);
         if (n === 0) {
           throw new Error("OPFS short write (0 bytes written)");
         }
         total += n;
       }
+      const end = offset + total;
+      if (end > cachedLen) cachedLen = end;
     },
 
     /** @returns {number} */
     len() {
       ensureOpen();
-      return syncHandle.getSize();
+      return cachedLen;
     },
 
     /** @param {number} newLen */
     setLen(newLen) {
       ensureOpen();
       syncHandle.truncate(newLen);
+      cachedLen = newLen;
     },
 
     sync() {
       ensureOpen();
-      syncHandle.flush();
+      if (enableSync) {
+        syncHandle.flush();
+      }
     },
 
     close() {
@@ -128,5 +153,5 @@ export async function createOpfsBackend(path, options = {}) {
   }
 
   const syncHandle = await fileHandle.createSyncAccessHandle();
-  return createOpfsBackendFromHandle(syncHandle);
+  return createOpfsBackendFromHandle(syncHandle, options);
 }
