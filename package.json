@@ -1,0 +1,49 @@
+{
+  "name": "redb-js",
+  "version": "0.1.0",
+  "description": "Thin WebAssembly wrapper for redb (Copy-on-Write ACID B-tree & single-file VFS) for Browser OPFS and Node.js",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jbsiddall/redb-js.git"
+  },
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    },
+    "./node": {
+      "types": "./src/node.d.ts",
+      "import": "./src/node.js"
+    },
+    "./vfs": {
+      "types": "./src/vfs.d.ts",
+      "import": "./src/vfs.js"
+    },
+    "./opfs-client": {
+      "types": "./src/worker/opfs-client.d.ts",
+      "import": "./src/worker/opfs-client.js"
+    },
+    "./opfs-worker": "./src/worker/opfs-worker.js",
+    "./wasm": "./dist/redb_wasm.wasm"
+  },
+  "files": [
+    "dist/redb_wasm.wasm",
+    "src/",
+    "rust/",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md"
+  ],
+  "scripts": {
+    "build:wasm": "cargo build --target wasm32-unknown-unknown --release && mkdir -p dist && cp target/wasm32-unknown-unknown/release/redb_wasm.wasm dist/redb_wasm.wasm",
+    "test": "node --test test/node.test.mjs",
+    "test:browser": "node test/browser-opfs.test.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {}
+}

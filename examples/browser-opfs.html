@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>redb-js Browser OPFS Demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    pre { background: #111; color: #eee; padding: 1rem; border-radius: 6px; overflow: auto; }
+    button { margin-right: 0.5rem; padding: 0.5rem 0.9rem; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>redb-js Browser OPFS Single-File VFS</h1>
+  <p>Stores all files inside a single <code>app.redb</code> file in the browser's Origin Private File System.</p>
+  <div>
+    <button id="append">Append log line</button>
+    <button id="snap">Take CoW snapshot</button>
+    <button id="restore">Restore last snapshot</button>
+    <button id="reload">Reload page</button>
+  </div>
+  <pre id="out">Opening OPFS...</pre>
+
+  <script type="module">
+    import { OpfsRedbClient } from "../src/worker/opfs-client.js";
+
+    const out = document.getElementById("out");
+    const client = await OpfsRedbClient.open("app.redb", {
+      cacheSize: 16 * 1024 * 1024,
+    });
+    let lastSnap = null;
+
+    async function render() {
+      const exists = await client.exists("/logs/app.log");
+      const content = exists ? await client.readTextFile("/logs/app.log") : "(empty)";
+      const size = await client.fileSize();
+      const snaps = await client.listSnapshots();
+      out.textContent = `OPFS single-file size: ${size} bytes\nSnapshots: [${snaps.join(", ")}]\n\n/logs/app.log:\n${content}`;
+    }
+
+    document.getElementById("append").onclick = async () => {
+      await client.appendFile("/logs/app.log", `[${new Date().toISOString()}] Hello OPFS!\n`);
+      await render();
+    };
+    document.getElementById("snap").onclick = async () => {
+      lastSnap = await client.snapshot();
+      await render();
+    };
+    document.getElementById("restore").onclick = async () => {
+      if (lastSnap != null) {
+        await client.restoreSnapshot(lastSnap);
+        await render();
+      }
+    };
+    document.getElementById("reload").onclick = () => location.reload();
+
+    await render();
+  </script>
+</body>
+</html>

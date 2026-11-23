@@ -1,0 +1,20 @@
+[package]
+name = "redb-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Thin WebAssembly wrapper around redb for Browser OPFS and Node.js single-file storage"
+
+[lib]
+path = "rust/src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+redb = { version = "4", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

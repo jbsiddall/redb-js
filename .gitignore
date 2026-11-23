@@ -1,0 +1,4 @@
+/target/
+*.redb
+*.tgz
+node_modules/
